@@ -78,7 +78,7 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		m_loop.setNotifyCallback!(EventType.read)(cast(FD)ret, &onChanges);
 
 		m_mutex.lock_nothrow();
-		m_watchers[ret] = WatcherState(basePath: path, recursive: recursive);
+		m_watchers[ret] = WatcherState(null, null, path, recursive);
 		m_mutex.unlock_nothrow();
 		addWatchRecursively(ret, -1, null);
 
