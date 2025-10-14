@@ -243,8 +243,11 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 	}
 
 	private void addWatchRecursivelySync(WatcherID id, int watch, string name)
-	@safe {
+	@safe nothrow {
+		import core.sys.posix.dirent : DT_DIR, DT_UNKNOWN,
+			dirent, opendir, closedir, readdir;
 		import std.path : baseName;
+		import std.string : indexOf, toStringz;
 
 		bool is_recursive;
 		string path;
@@ -252,12 +255,31 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		if (wd < 0) return;
 
 		if (is_recursive) {
-			try () @trusted {
-				foreach (de; path.dirEntries(SpanMode.shallow))
-					if (de.isDir)
-						addWatchRecursivelySync(id, wd, baseName(de.name));
+			() @trusted {
+				auto dir = opendir(path.toStringz);
+				if (!dir) return;
+				scope (exit) closedir(dir);
+
+				auto dfd = dirfd(dir);
+
+				dirent* de;
+				while ((de = readdir(dir)) !is null) {
+					if (!de.d_type.among(DT_DIR, DT_UNKNOWN))
+						continue;
+					auto idx = de.d_name[].indexOf('\0');
+					if (de.d_name[0 .. idx].among(".", ".."))
+						continue;
+					string dirname = de.d_name[0 .. idx].idup;
+					if (de.d_type == DT_UNKNOWN) {
+						stat_t st;
+						if (fstatat(dfd, de.d_name.ptr, &st, AT_SYMLINK_NOFOLLOW) != 0)
+							continue;
+						if (!S_ISDIR(st.st_mode))
+							continue;
+					}
+					addWatchRecursivelySync(id, wd, dirname);
+				}
 			} ();
-			catch (Exception e) {}
 		}
 	}
 
@@ -901,4 +923,44 @@ final class PollEventDriverWatchers(Events : EventDriverEvents) : EventDriverWat
 package struct WatcherSlot {
 	alias Handle = WatcherID;
 	FileChangesCallback callback;
+}
+
+version (Posix) {
+	import core.sys.posix.dirent : DIR;
+	import core.sys.posix.sys.stat;
+	import core.sys.posix.fcntl;
+	extern(C) @safe nothrow @nogc {
+		static if (!is(typeof(dirfd)))
+			 int dirfd(DIR*);
+		static if (!is(typeof(fstatat))) {
+			version (OSX) {
+    				version (AArch64) {
+        				int fstatat(int dirfd, const(char)* pathname, stat_t *statbuf, int flags);
+        			} else {
+						pragma(mangle, "fstatat$INODE64")
+						int fstatat(int dirfd, const(char)* pathname, stat_t *statbuf, int flags);
+    				}
+			} else int fstatat(int dirfd, const(char)* pathname, stat_t *statbuf, int flags);
+		}
+	}
+
+	version (OSX) {
+		static if (!is(typeof(AT_SYMLINK_NOFOLLOW)))
+			enum AT_SYMLINK_NOFOLLOW = 0x0020;
+	}
+
+	version (iOS) {
+		static if (!is(typeof(AT_SYMLINK_NOFOLLOW)))
+			enum AT_SYMLINK_NOFOLLOW = 0x0020;
+	}
+
+	version (CRuntime_Musl) {
+		static if (!is(typeof(AT_SYMLINK_NOFOLLOW)))
+			enum AT_SYMLINK_NOFOLLOW = 0x0100;
+	}
+
+	version (Android) {
+		static if (!is(typeof(AT_SYMLINK_NOFOLLOW)))
+			enum AT_SYMLINK_NOFOLLOW = 0x0100;
+	}
 }
