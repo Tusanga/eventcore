@@ -4,7 +4,7 @@ module eventcore.drivers.posix.watchers;
 import eventcore.driver;
 import eventcore.drivers.posix.driver;
 import eventcore.internal.ioworker;
-import eventcore.internal.utils : mallocT, freeT, nogc_assert;
+import eventcore.internal.utils : mallocT, freeT, nogc_assert, mallocNT;
 import eventcore.internal.dlist : StackDList;
 
 
@@ -48,6 +48,7 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		Mutex m_mutex;
 		WatcherState[WatcherID] m_watchers; // TODO: use a @nogc (allocator based) map
 		IOWorkerPool m_workerPool;
+		StackDList!Watch m_freeList;
 	}
 
 	this(Events events)
@@ -287,10 +288,6 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		if (wd == -1) return -1;
 
 
-		auto wst = allocWatch();
-		wst.id = wd;
-		wst.name = name;
-
 		{ // register watch in watcher slot
 			m_mutex.lock_nothrow();
 			scope (exit) m_mutex.unlock_nothrow();
@@ -302,6 +299,9 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 			if (wd in watcher.watches)
 				return wd;
 
+			auto wst = allocWatch();
+			wst.id = wd;
+			wst.name = name;
 			if (watch >= 0)  {
 				auto pw = watch in watcher.watches;
 				if (!pw) {
@@ -320,9 +320,23 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		return wd;
 	}
 
-	// TODO: use a free-list allocator
-	Watch* allocWatch() { return new Watch; }
-	void freeWatch(Watch* ws) {}
+	Watch* allocWatch()
+	{
+		if (m_freeList.empty) {
+			auto reserve = mallocNT!Watch(2048);
+			foreach (i; 0 .. reserve.length)
+				m_freeList.insertBack(&reserve[i]);
+		}
+
+		auto ret = m_freeList.back;
+		m_freeList.removeBack();
+		return ret;
+	}
+	void freeWatch(Watch* ws)
+	{
+		*ws = Watch.init;
+		m_freeList.insertBack(ws);
+	}
 
 	private void setupThreadPool()
 	{
