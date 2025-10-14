@@ -156,6 +156,7 @@ final class PosixEventDriver(Loop : PosixEventLoop) : EventDriver {
 			return false;
 
 		m_processes.dispose();
+		m_watchers.dispose();
 		m_files.dispose();
 		m_dns.dispose();
 		m_core.dispose();

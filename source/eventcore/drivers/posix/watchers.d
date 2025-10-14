@@ -3,30 +3,64 @@ module eventcore.drivers.posix.watchers;
 
 import eventcore.driver;
 import eventcore.drivers.posix.driver;
+import eventcore.internal.ioworker;
 import eventcore.internal.utils : mallocT, freeT, nogc_assert;
+import eventcore.internal.dlist : StackDList;
 
 
 final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriverWatchers
 {
 	import core.stdc.errno : errno, EAGAIN, EINPROGRESS;
 	import core.sys.posix.fcntl, core.sys.posix.unistd, core.sys.linux.sys.inotify;
+	import core.sync.mutex : Mutex;
 	import std.algorithm.comparison : among;
 	import std.file;
 
 	private {
 		alias Loop = typeof(Events.init.loop);
-		Loop m_loop;
 
-		struct WatchState {
-			string[int] watcherPaths;
-			string basePath;
-			bool recursive;
+		enum EVENTS = IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
+			IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO;
+
+		struct Watch {
+			Watch* parent, prev, next;
+			StackDList!Watch children;
+			string name;
+			int id;
+
+			@property string path()
+			const @safe nothrow {
+				// TODO: use just one allocation
+				return parent && parent.name.length ? parent.path() ~ "/" ~ name : name;
+			}
 		}
 
-		WatchState[WatcherID] m_watches; // TODO: use a @nogc (allocator based) map
+		struct WatcherState {
+			Watch* watch;
+			Watch*[int] watches; // TODO: use a @nogc (allocator based) map
+			string basePath;
+			bool recursive;
+
+			@disable this(this);
+		}
+
+		Loop m_loop;
+		Mutex m_mutex;
+		WatcherState[WatcherID] m_watchers; // TODO: use a @nogc (allocator based) map
+		IOWorkerPool m_workerPool;
 	}
 
-	this(Events events) { m_loop = events.loop; }
+	this(Events events)
+	nothrow @nogc {
+		m_loop = events.loop;
+		m_mutex = mallocT!Mutex();
+	}
+
+	void dispose()
+	@trusted {
+		m_workerPool = IOWorkerPool.init;
+		destroy(m_mutex);
+	}
 
 	final override WatcherID watchDirectory(string path, bool recursive, FileChangesCallback callback)
 	{
@@ -42,11 +76,10 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		m_loop.registerFD(cast(FD)ret, EventMask.read);
 		m_loop.setNotifyCallback!(EventType.read)(cast(FD)ret, &onChanges);
 
-		m_watches[ret] = WatchState(null, path, recursive);
-
-		addWatch(ret, path, "");
-		if (recursive)
-			addSubWatches(ret, path, "");
+		m_mutex.lock_nothrow();
+		m_watchers[ret] = WatcherState(basePath: path, recursive: recursive);
+		m_mutex.unlock_nothrow();
+		addWatchRecursively(ret, -1, null);
 
 		processEvents(ret);
 
@@ -77,7 +110,9 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 			m_loop.setNotifyCallback!(EventType.read)(fd, null);
 			m_loop.unregisterFD(fd, EventMask.read);
 			m_loop.clearFD!WatcherSlot(fd);
-			m_watches.remove(descriptor);
+			m_mutex.lock_nothrow();
+			m_watchers.remove(descriptor);
+			m_mutex.unlock_nothrow();
 			/*errnoEnforce(*/close(cast(int)fd)/* == 0)*/;
 			return false;
 		}
@@ -98,7 +133,6 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 
 	private void processEvents(WatcherID id)
 	{
-		import std.path : buildPath, dirName;
 		import core.stdc.stdio : FILENAME_MAX;
 		import core.stdc.string : strlen;
 
@@ -110,8 +144,6 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 				break;
 			assert(ret <= buf.length);
 
-			auto w = m_watches[id];
-
 			auto rem = buf[0 .. ret];
 			while (rem.length > 0) {
 				auto ev = () @trusted { return cast(inotify_event*)rem.ptr; } ();
@@ -120,40 +152,44 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 				// is the watch already deleted?
 				if (ev.mask & IN_IGNORED) continue;
 
-				FileChange ch;
-				if (ev.mask & (IN_CREATE|IN_MOVED_TO))
-					ch.kind = FileChangeKind.added;
-				else if (ev.mask & (IN_DELETE|IN_DELETE_SELF|IN_MOVE_SELF|IN_MOVED_FROM))
-					ch.kind = FileChangeKind.removed;
-				else if (ev.mask & IN_MODIFY)
-					ch.kind = FileChangeKind.modified;
-
-				if (ev.mask & IN_DELETE_SELF) {
-					() @trusted { inotify_rm_watch(cast(int)id, ev.wd); } ();
-					w.watcherPaths.remove(ev.wd);
-					continue;
-				} else if (ev.mask & IN_MOVE_SELF) {
-					// NOTE: the should have been updated by a previous IN_MOVED_TO
+				// if the directory for the watch gets deleted or moved, clean
+				// up all watches
+				if (ev.mask & (IN_DELETE_SELF|IN_MOVE_SELF)) {
+					removeWatchRecursively(id, ev.wd);
 					continue;
 				}
 
 				auto name = () @trusted { return ev.name.ptr[0 .. strlen(ev.name.ptr)]; } ();
 
-				auto subdir = w.watcherPaths[ev.wd];
-
-				// IN_MODIFY for directories reports the added/removed file instead of the directory itself
-				if (ev.mask == (IN_MODIFY|IN_ISDIR))
-					name = null;
-
-				if (w.recursive && ev.mask & (IN_CREATE|IN_MOVED_TO) && ev.mask & IN_ISDIR) {
-					auto subpath = subdir == "" ? name.idup : buildPath(subdir, name);
-					addWatch(id, w.basePath, subpath);
-					if (w.recursive)
-						addSubWatches(id, w.basePath, subpath);
+				FileChange ch;
+				if (ev.mask & (IN_CREATE|IN_MOVED_TO)) {
+					ch.kind = FileChangeKind.added;
+				} else if (ev.mask & (IN_DELETE|IN_MOVED_FROM)) {
+					ch.kind = FileChangeKind.removed;
+				} else if (ev.mask & IN_MODIFY) {
+					ch.kind = FileChangeKind.modified;
 				}
 
-				ch.baseDirectory = m_watches[id].basePath;
-				ch.directory = subdir;
+				string base_path, sub_path;
+				bool add_watch;
+
+				{
+					m_mutex.lock_nothrow();
+					scope (exit) m_mutex.unlock_nothrow();
+					auto watcher = &m_watchers[id];
+					if (!watcher) return;
+					auto pwatch = ev.wd in watcher.watches;
+					if (!pwatch) continue;
+					base_path = watcher.basePath;
+					sub_path = (*pwatch).path;
+					add_watch = ch.kind == FileChangeKind.added && watcher.recursive && (ev.mask & IN_ISDIR);
+				}
+
+				if (add_watch)
+					addWatchRecursively(id, ev.wd, name.idup);
+
+				ch.baseDirectory = base_path;
+				ch.directory = sub_path;
 				ch.name = name;
 				addRef(id); // assure that the id doesn't get invalidated until after the callback
 				auto cb = m_loop.m_fds[id].watcher.callback;
@@ -163,40 +199,135 @@ final class InotifyEventDriverWatchers(Events : EventDriverEvents) : EventDriver
 		}
 	}
 
-	private bool addSubWatches(WatcherID handle, string base_path, string subpath)
+	private void removeWatchRecursively(WatcherID id, int watch)
 	{
-		import std.path : buildPath, pathSplitter;
-		import std.range : drop;
-		import std.range.primitives : walkLength;
+		m_mutex.lock_nothrow();
+		scope (exit) m_mutex.unlock_nothrow();
 
-		try {
-			auto path = buildPath(base_path, subpath);
-			auto base_segements = base_path.pathSplitter.walkLength;
-			if (path.isDir) () @trusted {
-				foreach (de; path.dirEntries(SpanMode.depth))
-					if (de.isDir) {
-						auto subdir = de.name.pathSplitter.drop(base_segements).buildPath;
-						addWatch(handle, base_path, subdir);
-					}
-			} ();
-			return true;
-		} catch (Exception e) {
-			// TODO: decide if this should be ignored or if the error should be forwarded
-			return false;
+		auto watcher = &m_watchers[id];
+
+		void remove(Watch* watch)
+		@safe nothrow {
+			foreach (subwatch; watch.children)
+				remove(subwatch);
+
+			() @trusted { inotify_rm_watch(cast(int)id, watch.id); } ();
+
+			if (watch.parent) watch.parent.children.remove(watch);
+			else watcher.watch = null;
+
+			freeWatch(watch);
+		}
+
+		if (auto pw = watch in watcher.watches)
+			remove(*pw);
+	}
+
+	private void addWatchRecursively(WatcherID id, int watch, string name)
+	@trusted {
+		static void wrapper(InotifyEventDriverWatchers driver, WatcherID id, int watch, string name) {
+			driver.addWatchRecursivelySync(id, watch, name);
+		}
+
+		// add the base watch immediately to guarantee detecting changes
+		// directly within the folder
+		bool is_recursive;
+		string path;
+		auto wd = addWatch(id, watch, name, is_recursive, path);
+
+		if (is_recursive) {
+			setupThreadPool();
+			m_workerPool.run!wrapper(this, id, watch, name);
 		}
 	}
 
-	private bool addWatch(WatcherID handle, string base_path, string path)
+	private void addWatchRecursivelySync(WatcherID id, int watch, string name)
+	@safe {
+		import std.path : baseName;
+
+		bool is_recursive;
+		string path;
+		auto wd = addWatch(id, watch, name, is_recursive, path);
+		if (wd < 0) return;
+
+		if (is_recursive) {
+			try () @trusted {
+				foreach (de; path.dirEntries(SpanMode.shallow))
+					if (de.isDir)
+						addWatchRecursivelySync(id, wd, baseName(de.name));
+			} ();
+			catch (Exception e) {}
+		}
+	}
+
+	private int addWatch(WatcherID id, int watch, string name, out bool is_recursive, out string path)
 	{
 		import std.path : buildPath;
 		import std.string : toStringz;
 
-		enum EVENTS = IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
-			IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO;
-		immutable wd = () @trusted { return inotify_add_watch(cast(int)handle, buildPath(base_path, path).toStringz, EVENTS); } ();
-		if (wd == -1) return false;
-		m_watches[handle].watcherPaths[wd] = path;
-		return true;
+		{ // determine full path for watch
+			m_mutex.lock_nothrow();
+			scope (exit) m_mutex.unlock_nothrow();
+			auto watcher = id in m_watchers;
+			if (!watcher) return -1;
+
+			is_recursive = watcher.recursive;
+			if (watch >= 0) {
+				auto pw = watch in watcher.watches;
+				if (!pw) return -1;
+				path = buildPath(watcher.basePath, (*pw).path, name);
+			} else {
+				assert(name.length == 0);
+				path = watcher.basePath;
+			}
+		}
+
+		// create the new watch
+		immutable wd = () @trusted { return inotify_add_watch(cast(int)id, path.toStringz, EVENTS); } ();
+		if (wd == -1) return -1;
+
+
+		auto wst = allocWatch();
+		wst.id = wd;
+		wst.name = name;
+
+		{ // register watch in watcher slot
+			m_mutex.lock_nothrow();
+			scope (exit) m_mutex.unlock_nothrow();
+
+			auto watcher = id in m_watchers;
+			if (!watcher) return -1;
+
+			// already registered?
+			if (wd in watcher.watches)
+				return wd;
+
+			if (watch >= 0)  {
+				auto pw = watch in watcher.watches;
+				if (!pw) {
+					freeWatch(wst);
+					return -1;
+				}
+
+				wst.parent = *pw;
+				(*pw).children.insertBack(wst);
+			} else {
+				watcher.watch = wst;
+			}
+			watcher.watches[wd] = wst;
+		}
+
+		return wd;
+	}
+
+	// TODO: use a free-list allocator
+	Watch* allocWatch() { return new Watch; }
+	void freeWatch(Watch* ws) {}
+
+	private void setupThreadPool()
+	{
+		if (!m_workerPool)
+			m_workerPool = acquireIOWorkerPool();
 	}
 }
 
@@ -229,6 +360,10 @@ final class FSEventsEventDriverWatchers(Events : EventDriverEvents) : EventDrive
 	}
 
 	this(Events events) { m_events = events; }
+
+	void dispose()
+	{
+	}
 
 	final override WatcherID watchDirectory(string path, bool recursive, FileChangesCallback on_change)
 	@trusted {
