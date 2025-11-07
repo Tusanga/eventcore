@@ -89,8 +89,24 @@ final class WinAPIEventDriverSockets : EventDriverSockets {
 		} else {
 			clearSocketSlot(sock);
 			invalidateSocket();
-			on_connect(StreamSocketFD.invalid, ConnectStatus.unknownError);
+			on_connect(StreamSocketFD.invalid, getConnectStatus(err));
 			return StreamSocketFD.invalid;
+		}
+	}
+
+	private static ConnectStatus getConnectStatus(DWORD err)
+	{
+		switch (err) {
+			default: return ConnectStatus.unknownError;
+			case 0: return ConnectStatus.connected;
+			case WSAECONNREFUSED: return ConnectStatus.refused;
+			case WSAEACCES: return ConnectStatus.permissionDenied;
+			case WSAEADDRINUSE: return ConnectStatus.addressInUse;
+			case WSAEADDRNOTAVAIL: return ConnectStatus.addressNotAvailable;
+			case WSAEINTR: return ConnectStatus.interrupted;
+			case WSAENETUNREACH: return ConnectStatus.networkUnreachable;
+			case WSAEHOSTUNREACH: return ConnectStatus.hostUnreachable;
+			case WSAETIMEDOUT: return ConnectStatus.timeout;
 		}
 	}
 
@@ -1010,7 +1026,7 @@ final class WinAPIEventDriverSockets : EventDriverSockets {
 								slot.common.driver.m_core.removeWaiter();
 								if (err) {
 									slot.streamSocket.state = ConnectionState.closed;
-									cb(fd, ConnectStatus.refused);
+									cb(fd, getConnectStatus(err));
 								} else {
 									slot.streamSocket.state = ConnectionState.connected;
 									cb(fd, ConnectStatus.connected);

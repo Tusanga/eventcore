@@ -1102,6 +1102,12 @@ enum ConnectStatus {
 	timeout,
 	bindFailure,
 	socketCreateFailure,
+	networkUnreachable,
+	hostUnreachable,
+	interrupted,
+	addressNotAvailable,
+	addressInUse,
+	permissionDenied,
 	unknownError
 }
 
