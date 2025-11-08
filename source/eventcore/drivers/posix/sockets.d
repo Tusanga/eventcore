@@ -91,6 +91,8 @@ version (Windows) {
 	alias ENOTCONN = WSAENOTCONN;
 	alias ETIMEDOUT = WSAETIMEDOUT;
 	alias ESHUTDOWN = WSAESHUTDOWN;
+	alias EACCES = WSAEACCES;
+	alias EINTR = WSAEINTR;
 
 	enum SHUT_RDWR = SD_BOTH;
 	enum SHUT_RD = SD_RECEIVE;
@@ -226,6 +228,15 @@ final class PosixEventDriverSockets(Loop : PosixEventLoop) : EventDriverSockets 
 			default: return ConnectStatus.unknownError;
 			case 0: return ConnectStatus.connected;
 			case ECONNREFUSED: return ConnectStatus.refused;
+			static if (is(typeof(EPERM)))
+				case EPERM: goto case;
+			case EACCES: return ConnectStatus.permissionDenied;
+			case EADDRINUSE: return ConnectStatus.addressInUse;
+			case EADDRNOTAVAIL: return ConnectStatus.addressNotAvailable;
+			case EINTR: return ConnectStatus.interrupted;
+			case ENETUNREACH: return ConnectStatus.networkUnreachable;
+			case EHOSTUNREACH: return ConnectStatus.hostUnreachable;
+			case ETIMEDOUT: return ConnectStatus.timeout;
 		}
 	}
 
